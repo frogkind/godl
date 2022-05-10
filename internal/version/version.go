@@ -8,6 +8,8 @@ package version
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"errors"
@@ -75,6 +77,64 @@ func runGo(root string) {
 	os.Exit(0)
 }
 
+func gopath() (string, error) {
+	goenv := exec.Command("go", "env")
+	grep := exec.Command("grep", "GOPATH")
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+	goenv.Stdout = w
+	grep.Stdin = r
+	var buffer bytes.Buffer
+	grep.Stdout = &buffer
+	err := goenv.Start()
+	if err != nil {
+		return "", err
+	}
+	err = grep.Start()
+	if err != nil {
+		return "", err
+	}
+	goenv.Wait()
+	w.Close()
+	grep.Wait()
+	grepRes, err := buffer.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	gopathStr := strings.Split(grepRes, "\"")
+	if len(gopathStr) <= 2 {
+		return "", err
+	}
+	return gopathStr[1], nil
+}
+
+func joinFiles(file string) error {
+	dst, err := os.Create(file)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+	writer := bufio.NewWriter(dst)
+	for i := 0; i < 10; i++ {
+		srcFile := fmt.Sprintf("%s.%d", file, i)
+		if _, err := os.Stat(srcFile); err != nil {
+			break
+		}
+		src, err := os.Open(srcFile)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		reader := bufio.NewReader(src)
+		_, err = io.Copy(writer, reader)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // install installs a version of Go to the named target directory, creating the
 // directory as needed.
 func install(targetDir, version string) error {
@@ -87,37 +147,52 @@ func install(targetDir, version string) error {
 		return err
 	}
 	goURL := versionArchiveURL(version)
-	res, err := http.Head(goURL)
-	if err != nil {
-		return err
-	}
-	if res.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("no binary release of %v for %v/%v at %v", version, getOS(), runtime.GOARCH, goURL)
-	}
-	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned %v checking size of %v", http.StatusText(res.StatusCode), goURL)
-	}
+	var wantSHA string
 	base := path.Base(goURL)
 	archiveFile := filepath.Join(targetDir, base)
-	if fi, err := os.Stat(archiveFile); err != nil || fi.Size() != res.ContentLength {
+	if _, err := os.Stat(archiveFile); err != nil {
 		if err != nil && !os.IsNotExist(err) {
 			// Something weird. Don't try to download.
 			return err
 		}
-		if err := copyFromURL(archiveFile, goURL); err != nil {
-			return fmt.Errorf("error downloading %v: %v", goURL, err)
-		}
-		fi, err = os.Stat(archiveFile)
+		goPath, err := gopath()
 		if err != nil {
 			return err
 		}
-		if fi.Size() != res.ContentLength {
-			return fmt.Errorf("downloaded file %s size %v doesn't match server size %v", archiveFile, fi.Size(), res.ContentLength)
+		srcArchiveFile := filepath.Join(goPath, "pkg", "mod", "github.com", "frogkind", "godl@v"+strings.TrimPrefix(version, "go"), version, base)
+		fmt.Println("srcArchiveFile", srcArchiveFile)
+		if _, err = os.Stat(srcArchiveFile); err != nil && os.IsNotExist(err) {
+			if _, err = os.Stat(fmt.Sprintf("%s.0", srcArchiveFile)); err == nil {
+				err = joinFiles(srcArchiveFile)
+				if err != nil {
+					return err
+				}
+			}
 		}
-	}
-	wantSHA, err := slurpURLToString(goURL + ".sha256")
-	if err != nil {
-		return err
+		if _, err := os.Stat(srcArchiveFile); err != nil {
+			if err != nil && !os.IsNotExist(err) {
+				// Something weird. Don't try to download.
+				return err
+			}
+			if err := copyFromURL(archiveFile, goURL); err != nil {
+				return fmt.Errorf("error downloading %v: %v", goURL, err)
+			}
+			wantSHA, err = slurpURLToString(goURL + ".sha256")
+			if err != nil {
+				return err
+			}
+		} else {
+			archiveFile = srcArchiveFile
+			wantSHABuf, err := ioutil.ReadFile(archiveFile + ".sha256")
+			if err != nil {
+				return err
+			}
+			wantSHA = string(wantSHABuf)
+		}
+		_, err = os.Stat(archiveFile)
+		if err != nil {
+			return err
+		}
 	}
 	if err := verifySHA256(archiveFile, strings.TrimSpace(wantSHA)); err != nil {
 		return fmt.Errorf("error verifying SHA256 of %v: %v", archiveFile, err)
