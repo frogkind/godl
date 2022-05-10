@@ -104,7 +104,10 @@ func gopath() (string, error) {
 	}
 	gopathStr := strings.Split(grepRes, "\"")
 	if len(gopathStr) <= 2 {
-		return "", err
+		gopathStr = strings.Split(grepRes, "=")
+		if len(gopathStr) < 2 {
+			return "", err
+		}
 	}
 	return gopathStr[1], nil
 }
